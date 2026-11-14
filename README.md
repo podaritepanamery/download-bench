@@ -133,7 +133,7 @@ In the 87 KB example above, overall is 0.373 MB/s but transfer is 1.440 MB/s. Mo
 Why the first 16 KB are skipped in `transfer`: when the headers arrive, the first part of the body may already be in the socket buffer. Counting those bytes with no time attached would make the speed too high. Skipping the first chunk avoids that. Because of it:
 
 - A body of 16 KB or less has no transfer speed. Script prints `n/a`. The 15 KB image in the first example is such a case.
-- A body of a few tens of KB gives a rough value, because only a few milliseconds are measured. To measure bandwidth, request a file of several MB.
+- A body only a little above 16 KB gives a wrong value, because only a few bytes and microseconds are measured. On a local test server that delivers about 2000 MB/s, a 16 385-byte body printed 0.056 MB/s and a 20 000-byte body printed 327 MB/s. From about 64 KB it gets closer (65 536 bytes: 1565 MB/s) but is still rough. To measure bandwidth, request a file of several MB.
 
 Check against curl: on a local test server (0.3 s delay before headers, then 2 MB throttled to about 1.7 MB/s), curl body speed was 1.65 to 1.69 MB/s and `speed, transfer` was 1.63 to 1.67 MB/s over several runs and Python versions, while `speed, overall` was about 1.3 MB/s.
 
@@ -148,7 +148,7 @@ Check against curl: on a local test server (0.3 s delay before headers, then 2 M
 
 ## Tests
 
-Tests use [pytest](https://pytest.org). They start a local HTTP server that fails on purpose, so no internet is needed. Run time is about 3 seconds.
+Tests use [pytest](https://pytest.org). They start a local HTTP server that fails on purpose, so no internet is needed. Run time is about 6 seconds.
 
 ```bash
 python3 -m pip install pytest
@@ -158,8 +158,11 @@ python3 -m pytest
 What is covered:
 
 - normal response, small body without transfer speed, chunked body, body without `Content-Length`
+- default of 10 requests, requests sent strictly one at a time, script waits for the whole body
+- body sizes at and around the 16 KB chunk edge (0, 1, 16 383, 16 384, 16 385 bytes and more)
+- redirect followed, redirect loop, `localhost`, IPv6 address, 200 requests in a row, no files written
 - 404, a request that fails once in the middle, connection refused
-- timeout while waiting for headers and in the middle of the body
+- timeout while waiting for headers and in the middle of the body, and that the timeout limits each wait, not the whole request
 - connection dropped mid-body, chunked body cut off
 - transfer time leaves out the wait for headers, first 16 KB are not counted in transfer data
 - median, minimum, maximum, average over successful requests only, exit codes

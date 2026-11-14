@@ -47,6 +47,17 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        srv = self.server
+        with srv.lock:  # count how many requests are being served at the same time
+            srv.in_flight += 1
+            srv.max_in_flight = max(srv.max_in_flight, srv.in_flight)
+        try:
+            self.route()
+        finally:
+            with srv.lock:
+                srv.in_flight -= 1
+
+    def route(self):
         path = self.path
         hits = self.server.hits
         hits[path] = hits.get(path, 0) + 1
@@ -92,6 +103,25 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             w.write(b"x" * BIG)
             self.close_connection = True
+        elif path.startswith("/size/"):  # a body of exactly this many bytes
+            n = int(path[len("/size/"):])
+            self.head(n)
+            w.write(b"x" * n)
+        elif path == "/pause":  # a short pause, so overlapping requests would show
+            time.sleep(0.05)
+            self.head(BIG)
+            w.write(b"x" * BIG)
+        elif path == "/drip":  # 8 pieces of 10 bytes, 0.1 s apart
+            self.head(80)
+            for _ in range(8):
+                w.write(b"x" * 10)
+                w.flush()
+                time.sleep(0.1)
+        elif path in ("/redirect", "/redirect-loop"):
+            self.send_response(302)
+            self.send_header("Location", "/ok" if path == "/redirect" else path)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         else:
             self.send_error(404)
 
@@ -103,10 +133,21 @@ class QuietServer(ThreadingHTTPServer):
         pass  # the client hanging up on a stalled reply is expected
 
 
+class QuietServer6(QuietServer):
+    address_family = socket.AF_INET6
+
+
 class Server:
-    def __init__(self):
-        self.httpd = QuietServer(("127.0.0.1", 0), Handler)
+    def __init__(self, ipv6=False):
+        if ipv6:
+            self.httpd = QuietServer6(("::1", 0), Handler)
+        else:
+            self.httpd = QuietServer(("127.0.0.1", 0), Handler)
+        self.host = "[::1]" if ipv6 else "127.0.0.1"
         self.httpd.hits = {}
+        self.httpd.lock = threading.Lock()
+        self.httpd.in_flight = 0
+        self.httpd.max_in_flight = 0
         self.hits = self.httpd.hits
         self.port = self.httpd.server_address[1]
         # a short poll interval makes shutdown() return at once, not after 0.5 s
@@ -114,8 +155,12 @@ class Server:
             target=self.httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
         ).start()
 
-    def url(self, path):
-        return "http://127.0.0.1:%d%s" % (self.port, path)
+    @property
+    def max_in_flight(self):
+        return self.httpd.max_in_flight
+
+    def url(self, path, host=None):
+        return "http://%s:%d%s" % (host or self.host, self.port, path)
 
     def stop(self):
         self.httpd.shutdown()
@@ -364,6 +409,75 @@ def test_connection_refused():
     assert "requests:         0 ok, 2 failed" in text
 
 
+def test_requests_go_one_at_a_time(server):
+    code, text = run(server.url("/pause"), count=4)
+    assert code == 0
+    assert server.hits["/pause"] == 4
+    assert server.max_in_flight == 1  # never two requests open together
+
+
+def test_waits_for_the_whole_body(server):
+    r = bench.fetch(server.url("/drip"), 5.0)  # headers at once, body takes ~0.7 s
+    assert r.received == 80
+    assert r.headers < 0.3
+    assert r.total >= 0.6
+
+
+def test_timeout_limits_each_wait_not_the_whole_request(server):
+    # whole download takes ~0.8 s, longer than the 0.5 s timeout, but the
+    # server never stays silent for more than 0.1 s, so it must succeed
+    code, text = run(server.url("/drip"), count=1, timeout=0.5)
+    assert code == 0
+    assert "80 bytes" in text
+
+
+@pytest.mark.parametrize(
+    "n",
+    [0, 1, bench.CHUNK - 1, bench.CHUNK, bench.CHUNK + 1, 2 * bench.CHUNK, 3 * bench.CHUNK + 5],
+)
+def test_body_sizes_around_the_chunk_size(server, n):
+    r = bench.fetch(server.url("/size/%d" % n), 5.0)
+    assert r.received == n
+    assert r.xfer_bytes == max(0, n - bench.CHUNK)
+
+
+def test_redirect_is_followed(server):
+    code, text = run(server.url("/redirect"), count=2)
+    assert code == 0
+    assert "total data:       200000 bytes" in text
+
+
+def test_redirect_loop_is_a_failure(server):
+    code, text = run(server.url("/redirect-loop"), count=1)
+    assert code == 1
+    assert "FAILED" in text
+
+
+def test_many_requests(server):
+    code, text = run(server.url("/small"), count=200)
+    assert code == 0
+    assert "requests:         200 ok, 0 failed" in text
+    assert server.hits["/small"] == 200
+
+
+def test_host_name_localhost(server):
+    code, _ = run(server.url("/ok", host="localhost"), count=2)
+    assert code == 0
+
+
+def test_ipv6_address():
+    try:
+        srv = Server(ipv6=True)
+    except OSError:
+        pytest.skip("no IPv6 loopback on this machine")
+    try:
+        code, text = run(srv.url("/ok"), count=2)
+    finally:
+        srv.stop()
+    assert code == 0
+    assert "total data:       200000 bytes" in text
+
+
 # --- the command line --------------------------------------------------------
 
 
@@ -381,6 +495,26 @@ def test_cli_success(server):
     assert p.returncode == 0
     assert "requests:         2 ok, 0 failed" in p.stdout
     assert "speed, transfer:" in p.stdout
+    assert p.stderr == ""
+
+
+def test_cli_default_is_ten_requests(server):
+    p = cli(server.url("/ok"))  # no -n
+    assert p.returncode == 0
+    assert "requests:         10 ok, 0 failed" in p.stdout
+    assert server.hits["/ok"] == 10
+
+
+def test_cli_writes_no_files(server, tmp_path):
+    p = subprocess.run(
+        [sys.executable, os.path.join(HERE, "bench.py"), "-n", "2", server.url("/ok")],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        cwd=str(tmp_path),
+    )
+    assert p.returncode == 0
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_cli_exit_code_1_when_a_request_fails(server):
