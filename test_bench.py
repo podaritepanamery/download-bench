@@ -7,12 +7,14 @@ A few run bench.py as a command to check exit codes and usage errors.
 
 import io
 import os
+import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -25,6 +27,7 @@ SMALL = 1_000    # less than one chunk, so it does not
 STALL = 1.5      # how long the server sits silent, in seconds
 START_DELAY = 0.5  # how long /slow-start waits before it answers
 SHORT_TIMEOUT = 0.3
+CYRILLIC_PATH = "/картинка и фото.jpg"  # non-ASCII letters and a space
 
 
 # --- local test server -------------------------------------------------------
@@ -117,6 +120,15 @@ class Handler(BaseHTTPRequestHandler):
                 w.write(b"x" * 10)
                 w.flush()
                 time.sleep(0.1)
+        elif path == "/trickle":  # BIG bytes in 10 pieces, 0.02 s apart: slow enough to time
+            self.head(BIG)
+            for _ in range(10):
+                w.write(b"x" * (BIG // 10))
+                w.flush()
+                time.sleep(0.02)
+        elif urllib.parse.unquote(path) == CYRILLIC_PATH:  # arrives percent-encoded
+            self.head(BIG)
+            w.write(b"x" * BIG)
         elif path in ("/redirect", "/redirect-loop"):
             self.send_response(302)
             self.send_header("Location", "/ok" if path == "/redirect" else path)
@@ -197,7 +209,7 @@ def fake_fetch(monkeypatch, outcomes):
 
     def fetch(url, timeout):
         outcome = queue.pop(0)
-        if isinstance(outcome, Exception):
+        if isinstance(outcome, BaseException):
             raise outcome
         return outcome
 
@@ -255,6 +267,41 @@ def test_all_failed_prints_no_stats(monkeypatch):
     assert "speed" not in text
 
 
+def run_interrupted(count):
+    """Like run(), but a Ctrl-C that escapes run() fails the test instead of stopping pytest."""
+    try:
+        return run("http://x", count=count)
+    except KeyboardInterrupt:
+        pytest.fail("Ctrl-C escaped from run()")
+
+
+def test_ctrl_c_keeps_what_finished_and_returns_130(monkeypatch):
+    fake_fetch(monkeypatch, [result(0.1), result(0.3), KeyboardInterrupt()])
+    code, text = run_interrupted(count=5)
+    assert code == 130
+    assert len(request_lines(text)) == 2  # the running request is dropped
+    assert "requests:         2 ok, 0 failed" in text
+    assert "interrupted:      stopped by Ctrl-C after 2 of 5 requests" in text
+    assert "average time:     0.200 s" in text
+
+
+def test_ctrl_c_before_any_request_finished(monkeypatch):
+    fake_fetch(monkeypatch, [KeyboardInterrupt()])
+    code, text = run_interrupted(count=5)
+    assert code == 130
+    assert "requests:         0 ok, 0 failed" in text
+    assert "interrupted:      stopped by Ctrl-C after 0 of 5 requests" in text
+    assert "nothing to measure" in text
+
+
+def test_ctrl_c_counts_earlier_failures(monkeypatch):
+    fake_fetch(monkeypatch, [OSError("boom"), result(0.2), KeyboardInterrupt()])
+    code, text = run_interrupted(count=4)
+    assert code == 130  # interrupted wins over "some failed"
+    assert "requests:         1 ok, 1 failed" in text
+    assert "after 2 of 4 requests" in text
+
+
 def test_all_ok_returns_zero(monkeypatch):
     fake_fetch(monkeypatch, [result(0.1), result(0.2)])
     code, text = run("http://x", count=2)
@@ -294,16 +341,81 @@ def test_describe_http_error():
         ("ftp://example.com/a", False),
         ("http://[::1", False),
         ("", False),
+        ("http://:80/", False),                          # no host
+        ("http://127.0.0.1:65535/", True),               # highest port
+        ("http://127.0.0.1:65536/", False),              # one above
+        ("http://127.0.0.1:99999/", False),
+        ("http://127.0.0.1:0/", False),
+        ("http://127.0.0.1:abc/", False),
+        ("http://user:pass@127.0.0.1/", False),          # credentials are not supported
+        ("http://127.0.0.1/картинка.jpg", True),  # Cyrillic path
+        ("http://пример.рф/", True),             # Cyrillic host
+        ("http://" + "я" * 70 + ".рф/", False),  # host label longer than 63
     ],
 )
 def test_is_http_url(url, ok):
     assert bench.is_http_url(url) is ok
 
 
+@pytest.mark.parametrize(
+    "url, text",
+    [
+        ("ftp://example.com/a", "http:// or https://"),
+        ("http://127.0.0.1:99999/", "port must be a number from 1 to 65535"),
+        ("http://127.0.0.1:0/", "port must be a number from 1 to 65535"),
+        ("http://127.0.0.1:abc/", "port must be a number from 1 to 65535"),
+        ("http://user:pass@127.0.0.1/", "credentials"),
+        ("http://" + "я" * 70 + ".рф/", "host name cannot be converted"),
+    ],
+)
+def test_url_problem_says_what_is_wrong(url, text):
+    assert text in bench.url_problem(url)
+
+
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        ("http://h/a b.jpg", "http://h/a%20b.jpg"),
+        (
+            "http://h/картинка.jpg",
+            "http://h/%D0%BA%D0%B0%D1%80%D1%82%D0%B8%D0%BD%D0%BA%D0%B0.jpg",
+        ),
+        (
+            "http://h/a?q=фото&x=1#часть",
+            "http://h/a?q=%D1%84%D0%BE%D1%82%D0%BE&x=1#%D1%87%D0%B0%D1%81%D1%82%D1%8C",
+        ),
+        ("http://пример.рф/x", "http://xn--e1afmkfd.xn--p1ai/x"),
+        (
+            "http://пример.рф:8080/ф",
+            "http://xn--e1afmkfd.xn--p1ai:8080/%D1%84",
+        ),
+        ("https://пример.рф", "https://xn--e1afmkfd.xn--p1ai"),
+    ],
+)
+def test_to_ascii_url_encodes_like_a_browser(url, expected):
+    assert bench.to_ascii_url(url) == expected
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://h/a%20b?x=1&y=%D1%84",   # already encoded: leave alone
+        "http://[::1]:8000/ok",
+        "http://127.0.0.1:8000/a?",       # an empty query keeps its question mark
+        "https://example.com",
+        "http://h/a+b/c;d=e~f",
+    ],
+)
+def test_to_ascii_url_leaves_plain_addresses_alone(url):
+    assert bench.to_ascii_url(url) == url
+
+
 # --- real HTTP against the local server --------------------------------------
 
 
-def test_normal_response(server):
+def test_normal_response(server, monkeypatch):
+    # loopback is too fast for the real 1 ms limit, so switch the limit off here
+    monkeypatch.setattr(bench, "MIN_TRANSFER_SECS", 0.0)
     code, text = run(server.url("/ok"), count=3)
     assert code == 0
     assert len(request_lines(text)) == 3
@@ -322,14 +434,16 @@ def test_small_body_has_no_transfer_speed(server):
     assert "speed, overall:   n/a" not in text
 
 
-def test_transfer_time_leaves_out_the_wait_for_headers(server):
+def test_transfer_time_leaves_out_the_wait_for_headers(server, monkeypatch):
+    monkeypatch.setattr(bench, "MIN_TRANSFER_SECS", 0.0)
     r = bench.fetch(server.url("/slow-start"), 5.0)
     assert r.headers >= START_DELAY * 0.9  # the wait shows up in "headers"
     assert r.total >= r.headers
     assert r.xfer_secs < START_DELAY / 2  # and not in the transfer time
 
 
-def test_transfer_bytes_leave_out_the_first_chunk(server):
+def test_transfer_bytes_leave_out_the_first_chunk(server, monkeypatch):
+    monkeypatch.setattr(bench, "MIN_TRANSFER_SECS", 0.0)
     r = bench.fetch(server.url("/ok"), 5.0)
     assert r.received == BIG
     assert r.xfer_bytes == BIG - bench.CHUNK
@@ -435,10 +549,70 @@ def test_timeout_limits_each_wait_not_the_whole_request(server):
     "n",
     [0, 1, bench.CHUNK - 1, bench.CHUNK, bench.CHUNK + 1, 2 * bench.CHUNK, 3 * bench.CHUNK + 5],
 )
-def test_body_sizes_around_the_chunk_size(server, n):
+def test_body_sizes_around_the_chunk_size(server, monkeypatch, n):
+    monkeypatch.setattr(bench, "MIN_TRANSFER_SECS", 0.0)
     r = bench.fetch(server.url("/size/%d" % n), 5.0)
     assert r.received == n
     assert r.xfer_bytes == max(0, n - bench.CHUNK)
+
+
+class FakeResponse:
+    """Stands in for the object urlopen returns, so the clock can be faked too."""
+
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        self.headers = {}
+
+    def read(self, n):
+        return self.chunks.pop(0) if self.chunks else b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.mark.parametrize(
+    "secs, counted",
+    [(0.0, False), (0.0005, False), (0.00099, False), (0.001, True), (0.0011, True), (2.5, True)],
+)
+def test_the_real_one_millisecond_limit(monkeypatch, secs, counted):
+    # clock reads in fetch(): start, headers arrived, first chunk read, last byte read
+    ticks = iter([0.0, 0.0, 0.0, secs])
+    monkeypatch.setattr(bench.time, "perf_counter", lambda: next(ticks))
+    body = FakeResponse([b"x" * bench.CHUNK, b"y" * 50_000])
+    monkeypatch.setattr(bench.urllib.request, "urlopen", lambda req, timeout: body)
+    r = bench.fetch("http://x/", 5.0)
+    assert r.received == bench.CHUNK + 50_000
+    if counted:
+        assert r.xfer_bytes == 50_000
+        assert r.xfer_secs == pytest.approx(secs)
+    else:
+        assert (r.xfer_bytes, r.xfer_secs) == (0, 0.0)
+
+
+def test_transfer_speed_is_dropped_when_the_measurement_is_too_short(server, monkeypatch):
+    # defect found in QA: a measured part of a few bytes took microseconds and
+    # printed a wildly wrong speed. Such a request must not count at all.
+    monkeypatch.setattr(bench, "MIN_TRANSFER_SECS", 1e9)  # nothing is long enough
+    r = bench.fetch(server.url("/ok"), 5.0)
+    assert r.received == BIG
+    assert (r.xfer_bytes, r.xfer_secs) == (0, 0.0)
+    code, text = run(server.url("/ok"), count=2)
+    assert code == 0
+    assert "speed, transfer:  n/a" in text
+    assert "speed, overall:   n/a" not in text
+
+
+def test_transfer_speed_is_kept_when_the_measurement_is_long_enough(server):
+    # /trickle takes ~0.2 s, far above the real 1 ms limit
+    r = bench.fetch(server.url("/trickle"), 5.0)
+    assert r.received == BIG
+    assert r.xfer_bytes == BIG - bench.CHUNK
+    assert r.xfer_secs >= 0.1
+    rate = r.xfer_bytes / r.xfer_secs
+    assert 0.1e6 < rate < 1.5e6  # about 0.5 MB/s, wide margin for a busy machine
 
 
 def test_redirect_is_followed(server):
@@ -476,6 +650,17 @@ def test_ipv6_address():
         srv.stop()
     assert code == 0
     assert "total data:       200000 bytes" in text
+
+
+def test_non_ascii_path_with_a_space_is_sent_percent_encoded(server):
+    # defect found in QA: this address used to fail with "'ascii' codec can't encode"
+    code, text = run(server.url(CYRILLIC_PATH), count=2)
+    assert code == 0
+    assert "total data:       200000 bytes" in text
+    sent = list(server.hits)
+    assert len(sent) == 1
+    assert sent[0].isascii() and " " not in sent[0]
+    assert urllib.parse.unquote(sent[0]) == CYRILLIC_PATH
 
 
 # --- the command line --------------------------------------------------------
@@ -530,6 +715,9 @@ def test_cli_exit_code_1_when_a_request_fails(server):
         (["file:///etc/hosts"], "http:// or https://"),
         (["-n", "0", "http://127.0.0.1/"], "--count"),
         (["-t", "0", "http://127.0.0.1/"], "--timeout"),
+        (["http://127.0.0.1:99999/"], "port must be a number from 1 to 65535"),
+        (["http://127.0.0.1:abc/"], "port must be a number from 1 to 65535"),
+        (["http://user:pass@127.0.0.1/"], "credentials"),
     ],
 )
 def test_cli_usage_errors_exit_2_and_make_no_request(args, message):
@@ -537,3 +725,47 @@ def test_cli_usage_errors_exit_2_and_make_no_request(args, message):
     assert p.returncode == 2
     assert message in p.stderr
     assert p.stdout == ""
+
+
+def test_cli_non_ascii_address(server):
+    p = cli("-n", "2", server.url(CYRILLIC_PATH))
+    assert p.returncode == 0
+    assert "requests:         2 ok, 0 failed" in p.stdout
+    assert p.stderr == ""
+
+
+def popen(*args):
+    return subprocess.Popen(
+        [sys.executable, os.path.join(HERE, "bench.py")] + list(args),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX signals")
+def test_cli_ctrl_c_prints_a_summary_and_no_traceback(server):
+    # defect found in QA: Ctrl-C used to end with a traceback and lose the results
+    p = popen("-n", "6", server.url("/drip"))  # each request takes ~0.7 s
+    first = p.stdout.readline()  # lines are flushed one by one, so this arrives at once
+    assert first.startswith("request  1:")
+    p.send_signal(signal.SIGINT)  # request 2 is running now
+    out, err = p.communicate(timeout=30)
+    assert p.returncode == 130
+    assert "requests:         1 ok, 0 failed" in out
+    assert "interrupted:      stopped by Ctrl-C after 1 of 6 requests" in out
+    assert "speed, overall:" in out
+    assert "Traceback" not in err and err == ""
+
+
+def test_cli_closed_output_pipe_is_quiet(server):
+    # defect found in QA: `bench.py ... | head -1` used to end with a BrokenPipeError traceback
+    p = popen("-n", "2000", server.url("/small"))
+    assert p.stdout.readline().startswith("request  1:")
+    p.stdout.close()  # the reader goes away
+    err = p.stderr.read()
+    p.stderr.close()
+    p.wait(timeout=60)
+    assert p.returncode == 141
+    assert err == ""
+    assert server.hits["/small"] < 2000  # it stopped instead of finishing all requests
