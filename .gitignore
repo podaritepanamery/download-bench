@@ -1,2 +1,7 @@
 __pycache__/
 .pytest_cache/
+
+# секреты: только в .env, в git не попадают
+.env
+.env.*
+!.env.example
